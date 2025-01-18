@@ -1,0 +1,714 @@
+#include <SPI.h>
+#include <mcp2515_can.h>
+#include <EEPROM.h>
+#include <HardwareSerial.h>
+#include <Adafruit_NeoPixel.h> // Добави библиотеката за WS2812
+
+#define OIL_PRESSURE_PIN 35 // Аналогов вход за сензора за налягане на масло (GPIO36)
+#define LED_PIN_27 27       // Избери GPIO пин за управление на LED на pin 27
+#define LED_PIN_26 26       // Избери GPIO пин за управление на LED на pin 26
+#define NUM_LEDS 8          // Брой на LED диодите
+#define CAN0_INT 21         // GPIO, свързан към INT пин на MCP2515
+#define CAN0_CS 5   
+#define THERMISTOR_PIN 34  // Аналогов вход, на който е свързан термисторът
+
+
+
+mcp2515_can CAN0(CAN0_CS);
+
+Adafruit_NeoPixel strip27(NUM_LEDS, LED_PIN_27, NEO_GRB + NEO_KHZ800);  // WS2812 for pin 27
+Adafruit_NeoPixel strip26(NUM_LEDS, LED_PIN_26, NEO_GRB + NEO_KHZ800);  // WS2812 for pin 26
+// CS_PIN = 5   
+// INT_PIN = 21  
+//// SCK_PIN = 18  
+// MOSI_PIN = 23   
+// MISO_PIN = 19
+HardwareSerial nextionSerial(2);
+
+// Константи за Стейнхарт-Харт уравнение
+const float A = 0.001294;
+const float B = 0.0002602;
+const float C = 0.0000001747;
+
+// Променливи за термистора
+float smoothedTemperature = 0.0; // Осреднена стойност на температурата
+const float smoothingFactor = 0.1; // Фактор за изглаждане (0.0 до 1.0)
+unsigned long lastUpdateTime = 0; // Последно време за обновяване
+const unsigned long updateInterval = 500; // Интервал за обновяване (2 секунди)
+
+const unsigned long canUpdateInterval = 500; // Интервал за CAN съобщенията
+unsigned long lastCanUpdateTime = 0;        // Последно време на изпращане
+
+
+// Декларации на останалите функционалности
+int previousSliderValue = -1; // Запази предишната стойност на слайдера
+int sameValueCount = 0; // Брояч за последователни еднакви стойности
+int consecutiveLowPressureCount = 0;  // Брояч за последователни ниски налягания
+int requiredConsecutiveReadings = 5;  // Изискван брой последователни четения под x11
+bool ledsActivated = false;           // Флаг, дали LED-овете са активирани
+bool shiftLightActive = false; // Декларация на променливата
+float maxOilPressure = 7.00;  // Дефиниране на максималната стойност
+float x11Value = 0.0;  // Variable to store x11 value
+int16_t shiftRpmValue = 0;  // Variable to store n0 value
+float sensorValue = 0.0; // Съхраняване на стойността на сензора
+float oilTemperature = 0.0; // Температура на маслото
+float oilPressure = 0.0;    // Налягане на маслото
+int brightness = 255; // Яркост по подразбиране (максимална)
+float qrkost = 0.0;
+
+
+
+// Функция за изчисляване на температурата
+float calculateTemperature(int analogValue) {
+    // Преобразуване на аналоговата стойност във волта
+    float voltage = analogValue * (3.3 / 4095.0);
+
+    // Изчисляване на съпротивлението на термистора
+    float resistance = (280.0 * voltage) / (3.3 - voltage);
+
+    // Логаритъм на съпротивлението
+    float logR = log(resistance);
+
+    // Уравнение на Стейнхарт-Харт
+    float invTempK = A + B * logR + C * pow(logR, 3);
+
+    // Преобразуване в градуси Целзий
+    return (1.0 / invTempK) - 273.15;
+}
+
+
+
+
+
+void readSliderFromNextion() {
+    while (Serial2.available()) {
+        Serial2.read(); // Изчисти остатъците от данни
+    }
+
+    Serial2.print("get h0.val");
+    Serial2.write(0xff);
+    Serial2.write(0xff);
+    Serial2.write(0xff);
+
+    delay(10);
+
+    if (Serial2.available()) {
+        if (Serial2.read() == 0x71) { // 0x71 е заглавие за числов отговор
+            uint32_t value = 0;
+            for (int i = 0; i < 4; i++) {
+                value |= (uint32_t)Serial2.read() << (8 * i);
+            }
+            qrkost = map(value, 0, 100, 0, 255); // Преобразувай стойността от слайдера (0–100) в яркост (0–255)
+            Serial.print("qrkost: ");
+            Serial.println(qrkost);
+        }
+    }
+}
+
+
+
+
+void sendOilPressureToCAN(float oilPressure) {
+    // Увеличаване на разделителната способност (0–7 бара -> 0–255)
+    uint8_t pressureValue = map(oilPressure * 100, 0, 700, 0, 255); // Мащабиране
+
+    // Подготовка на данните за изпращане
+    uint8_t data[8] = {0}; // Масив за данни (макс. 8 байта)
+    data[0] = pressureValue; // Налягането е в offset 0
+
+    // Изпращане на съобщението
+    byte sndStat = CAN0.sendMsgBuf(4, 0, 1, data); // ID = 4, DLC = 1
+    if (sndStat == CAN_OK) {
+        Serial.print("CAN съобщение изпратено успешно. Налягане: ");
+        Serial.println(oilPressure, 2); // Показване с 2 знака след десетичната запетая
+    } else {
+        Serial.println("Грешка при изпращане на CAN съобщението за налягане!");
+    }
+}
+
+
+void sendOilTempToCAN(float oilTemperature) {
+    // Преобразуване на температурата към цяло число (1 байт)
+    uint8_t tempValue = (uint8_t)oilTemperature;
+
+    // Подготовка на данните за изпращане
+    uint8_t data[8] = {0}; // Масив за данните (макс. 8 байта)
+    data[2] = tempValue;   // Задаваме температурата на офсет 2
+
+    // Изпращане на съобщението
+    byte sndStat = CAN0.sendMsgBuf(5, 0, 8, data); // ID = 4, DLC = 8
+    if (sndStat == CAN_OK) {
+        Serial.print("CAN съобщение изпратено успешно. Температура: ");
+        Serial.println(tempValue);
+    } else {
+        Serial.println("Грешка при изпращане на CAN съобщението!");
+    }
+}
+
+// Функция за изпращане на данни за температура и налягане чрез CAN
+void sendOilDataOverCAN() {
+    byte oilTemperatureData[8] = {0}; // Буфер за данните за температура
+    byte oilPressureData[8] = {0};   // Буфер за данните за налягане
+
+    // Преобразуване на температурата за изпращане
+    int tempValue = map(oilTemperature, -40, 140, 0, 255); // Преобразуване в стойност 0-255
+    tempValue = constrain(tempValue, 0, 255);              // Ограничаване на стойностите
+    oilTemperatureData[0] = tempValue;                    // Температурата е в offset 0
+
+    // Преобразуване на налягането за изпращане
+    int pressureValue = map(oilPressure, 0, 10, 0, 255); // Преобразуване в стойност 0-255
+    pressureValue = constrain(pressureValue, 0, 255);    // Ограничаване на стойностите
+    oilPressureData[0] = pressureValue;                 // Налягането е в offset 0
+
+    // Изпращане на съобщението за температура
+    if (CAN0.sendMsgBuf(3, 0, 1, oilTemperatureData) == CAN_OK) {
+        Serial.println("Температурата на маслото е изпратена успешно.");
+    } else {
+        Serial.println("Грешка при изпращане на температурата на маслото!");
+    }
+
+    // Изпращане на съобщението за налягане
+    if (CAN0.sendMsgBuf(4, 0, 1, oilPressureData) == CAN_OK) {
+        Serial.println("Налягането на маслото е изпратено успешно.");
+    } else {
+        Serial.println("Грешка при изпращане на налягането на маслото!");
+    }
+}
+
+
+
+
+void readThermistorAndSend() {
+    int analogValue = analogRead(THERMISTOR_PIN);
+    float currentTemperature = calculateTemperature(analogValue);
+
+    // Осредняване на температурата
+    smoothedTemperature = smoothedTemperature * (1.0 - smoothingFactor) + currentTemperature * smoothingFactor;
+
+    // Проверка дали температурата е под 60°C
+    if (smoothedTemperature < 60.0) {
+        smoothedTemperature = 60.0; // Ако е под 60°C, да показва 60°C
+        // Промяна на цвета на x6.val на 2047 (червен)
+        Serial2.print("x6.pco=2047");
+        Serial2.write(0xff);
+        Serial2.write(0xff);
+        Serial2.write(0xff);
+    } else {
+        // Промяна на цвета на x6.val обратно към стандартния (може да е 65535 или друг цветен код)
+        Serial2.print("x6.pco=65535"); // Примерен цветен код за нормално състояние (бяло)
+        Serial2.write(0xff);
+        Serial2.write(0xff);
+        Serial2.write(0xff);
+    }
+
+    // Проверка за интервал на обновяване
+    if (millis() - lastUpdateTime >= updateInterval) {
+        lastUpdateTime = millis(); // Обновяване на времето
+
+        // Показване на температурата в сериен монитор
+        Serial.print("Осреднена температура (C): ");
+        Serial.println(smoothedTemperature);
+
+        // Изпращане към Nextion
+        Serial2.print("x6.val=");
+        Serial2.print((int)smoothedTemperature); // Цяло число за дисплея
+        Serial2.write(0xff);
+        Serial2.write(0xff);
+        Serial2.write(0xff);
+
+        // Изпращане на температурата на маслото през CAN
+        sendOilTempToCAN(smoothedTemperature);
+        sendOilPressureToCAN(oilPressure);
+
+    }
+}
+
+
+
+unsigned long lastX11ReadTime = 0;  // Променлива за време
+unsigned long x11ReadInterval = 500;  // Интервал за четене на x11
+
+
+void readX11ValueFromNextion() {
+  if (millis() - lastX11ReadTime >= x11ReadInterval) {  // Проверка за изминалото време
+    lastX11ReadTime = millis();  // Обновяване на последното време на четене
+
+    // Изпращане на командата за четене на x11
+    Serial2.print("get x11.val");
+    Serial2.write(0xff);
+    Serial2.write(0xff);
+    Serial2.write(0xff);
+
+    
+
+    // Проверка дали има налични данни
+    if (Serial2.available()) {
+      // Четене на хедъра за числов отговор
+      if (Serial2.read() == 0x71) {  // 0x71 е хедърът за числов отговор
+        uint32_t value = 0;
+
+        // Четене на 4 байта за стойността
+        for (int i = 0; i < 4; i++) {
+          if (Serial2.available()) {
+            value |= (uint32_t)Serial2.read() << (8 * i);  // Събиране на 4 байта в едно 32-битово число
+          } else {
+            Serial.println("Error: Incomplete data for x11");
+            return; // Прекратяване, ако данните не са пълни
+          }
+        }
+
+        // Преобразуване на стойността в десетична форма (ако е необходимо)
+        x11Value = value / 10.0;  // Ако стойността е в deci-bars
+        Serial.print("x11Value updated: ");
+        Serial.println(x11Value);
+      } else {
+        Serial.println("Error: Invalid response header for x11");
+      }
+    } else {
+      Serial.println("Error: No response from Nextion for x11");
+    }
+  }
+}
+
+
+// Function to read n0.val (shift RPM) from Nextion and filter for values between 4000 and 8500
+void readShiftRpmFromNextion() {
+  while (Serial2.available()) {
+    Serial2.read();  // Clear any leftover data
+  }
+
+  Serial2.print("get n0.val");
+  Serial2.write(0xff);
+  Serial2.write(0xff);
+  Serial2.write(0xff);
+  delay(10);
+
+  if (Serial2.available()) {
+    if (Serial2.read() == 0x71) {  // 0x71 is the header for numeric response
+      uint32_t value = 0;
+      for (int i = 0; i < 4; i++) {
+        value |= (uint32_t)Serial2.read() << (8 * i);  // Read and assemble 4-byte response
+      }
+      int16_t tempRpmValue = value;
+
+      // Show the raw value from Nextion on the Serial Monitor
+      Serial.print("Raw Shift RPM: ");
+      Serial.println(tempRpmValue);
+
+      // Apply filter: Only accept values between 4000 and 8500
+      if (tempRpmValue >= 4000 && tempRpmValue <= 8500) {
+        shiftRpmValue = tempRpmValue;
+        Serial.print("Shift RPM (Filtered): ");
+        Serial.println(shiftRpmValue);
+      } else {
+        Serial.println("Shift RPM out of range, ignoring...");
+      }
+    }
+  }
+}
+
+
+
+
+
+
+
+
+unsigned long blinkInterval = 50; // интервал за мигане (в милисекунди)
+unsigned long lastBlinkTime = 0;
+bool ledState = false;
+
+void updateShiftLight(int rpm_g) {
+    strip27.clear(); // Изчисти всички светодиоди в началото
+
+    int blueThreshold = shiftRpmValue - 1500; // Под 1500 оборота за сините
+    int redThreshold = shiftRpmValue - 500;  // Последните 500 оборота за червените
+
+    // Запалване на сините светодиоди (ниски обороти)
+    if (rpm_g >= blueThreshold) {
+        int ledsToLight = map(rpm_g, blueThreshold, shiftRpmValue - 500, 0, NUM_LEDS / 2);  // Първите 50% LED за сини
+        for (int i = 0; i < ledsToLight; i++) {
+            strip27.setPixelColor(i, strip27.Color(0, 255, 0)); // Син цвят
+           
+        }
+    }
+
+    // Запалване на червените светодиоди (по-високи обороти)
+    if (rpm_g >= redThreshold) {
+        int ledsToLight = map(rpm_g, redThreshold, shiftRpmValue, NUM_LEDS / 2, NUM_LEDS);  // Вторите 50% LED за червени
+        for (int i = NUM_LEDS / 2; i < ledsToLight; i++) {
+            strip27.setPixelColor(i, strip27.Color(255, 0, 0)); // Червен цвят
+        }
+    }
+
+    // Ако RPM достигне или надвиши shiftRpmValue, светлините мигат
+    if (rpm_g >= shiftRpmValue) {
+        if (millis() - lastBlinkTime >= blinkInterval) {
+            lastBlinkTime = millis();
+            ledState = !ledState; // Превключване на състоянието на LED
+
+            for (int i = 0; i < NUM_LEDS; i++) {
+                if (ledState) {
+                    strip27.setPixelColor(i, strip27.Color(255, 0, 0)); // Червено
+                } else {
+                    strip27.setPixelColor(i, strip27.Color(0, 0, 0)); // Изключване
+                }
+            }
+        }
+    }
+
+    strip27.show(); // Обнови LED светлините
+}
+
+
+
+
+
+
+void sendRPMToNextion(int16_t rpm_g);
+void sendBatteryToNextion(int16_t batteryVoltage);
+void sendMapToNextion(int16_t mapValue);
+void sendMatToNextion(int16_t matValue);
+void sendCltToNextion(int16_t cltValue);
+void sendAFRToNextion(int16_t afrValue);
+void sendOilPressureToNextion(float oilPressure);
+
+
+void sendOilPressureToNextion(float oilPressure) {
+  Serial2.print("x7.val="); // x7.val е променливата в Nextion за налягането на масло
+  Serial2.print((int)(oilPressure * 100));  // Умножаваме по 100 за да изпратим цяло число
+  Serial2.write(0xff);
+  Serial2.write(0xff);
+  Serial2.write(0xff);
+  Serial.print("Sending Oil Pressure to Nextion: ");
+  Serial.println((int)(oilPressure * 100));  // Принтиране на стойността, която се изпраща
+  
+}
+
+void sendRPMToNextion(int16_t rpm_g) {
+   
+
+  Serial2.print("x5.val=");
+  Serial2.print(rpm_g);
+  Serial2.write(0xff);
+  Serial2.write(0xff);
+  Serial2.write(0xff);
+
+  int progressBarValue = (rpm_g * 100) / 8500;
+  Serial2.print("j0.val=");
+  Serial2.print(progressBarValue);
+  Serial2.write(0xff);
+  Serial2.write(0xff);
+  Serial2.write(0xff);
+  delay(10);
+}
+
+void sendBatteryToNextion(int16_t batteryVoltage) {
+  Serial2.print("x1.val=");
+  Serial2.print(batteryVoltage);
+  Serial2.write(0xff);
+  Serial2.write(0xff);
+  Serial2.write(0xff);
+  delay(10);
+}
+
+void sendMapToNextion(int16_t mapValue) {
+  Serial2.print("x0.val=");
+  Serial2.print(mapValue - 100);
+  Serial2.write(0xff);
+  Serial2.write(0xff);
+  Serial2.write(0xff);
+  delay(10);
+}
+
+void sendMatToNextion(int16_t matValue) {
+  Serial2.print("x3.val=");
+  Serial2.print(matValue / 10);
+  Serial2.write(0xff);
+  Serial2.write(0xff);
+  Serial2.write(0xff);
+  delay(10);
+}
+
+void sendCltToNextion(int16_t cltValue) {
+  Serial2.print("x2.val=");
+  Serial2.print(cltValue / 10);
+  Serial2.write(0xff);
+  Serial2.write(0xff);
+  Serial2.write(0xff);
+  delay(10);
+}
+
+void sendAFRToNextion(int16_t afrValue) {
+  Serial2.print("x4.val=");
+  Serial2.print(afrValue);
+  Serial2.write(0xff);
+  Serial2.write(0xff);
+  Serial2.write(0xff);
+  delay(10);
+}
+
+
+void setup() {
+  Serial.begin(115200);
+  Serial2.begin(115200, SERIAL_8N1, 33, 32);
+  strip27.begin();  // Initialize LED strip on pin 27
+  strip26.begin();  // Initialize LED strip on pin 26
+  
+strip27.clear();
+strip27.show();
+strip26.clear();
+strip26.show();
+
+  while (!Serial) { ; }
+
+  if (CAN0.begin(CAN_500KBPS, MCP_16MHz) == CAN_OK) {
+    Serial.println("CAN инициализиран успешно");
+  } else {
+    Serial.println("CAN инициализацията не успя");
+    while (1);
+  }
+  pinMode(CAN0_INT, INPUT);
+
+  // Read the initial shift RPM value from Nextion
+  readShiftRpmFromNextion();  // Initialize with n0.val value
+
+
+
+
+  // Инициализация на аналоговия вход за налягане на масло
+  pinMode(OIL_PRESSURE_PIN, INPUT);
+}
+
+void readOilPressure() {
+    int rawValue = analogRead(OIL_PRESSURE_PIN);
+    Serial.print("Raw Sensor Value: "); Serial.println(rawValue);
+    
+    // Преобразуване в напрежение
+    float voltage = (rawValue / 4095.0) * 3.3;  // Преобразуваме стойността в напрежение
+    Serial.print("Voltage: "); Serial.println(voltage);
+
+    // Линейна интерполация
+    if (voltage < 0.6) {
+        sensorValue = 0; // Под 0.5V = 0
+    } else if (voltage > 4.5) {
+        sensorValue = 10; // Над 4.5V = 10
+    } else {
+        // Коригирана формула
+        sensorValue = (voltage - 0.5) * (10.0 / (4.0)); // Обновена формула
+    }
+
+    // Ограничаване на стойностите на sensorValue
+    sensorValue = constrain(sensorValue, 0, 10);
+    
+    Serial.print(" Sensor Value: "); Serial.println(sensorValue);
+
+    // Проверка за валидно налягане
+    if (voltage < 0.0 || voltage > 3.3) {  // Примерен обхват за датчика
+        oilPressure = maxOilPressure; // При проблем със сензора показваме максималната стойност
+        Serial2.print("x7.pco=65504");  // Червен цвят (RGB565 код)
+        Serial2.write(0xff);
+        Serial2.write(0xff);
+        Serial2.write(0xff);
+    } else {
+        // Пресмятане на налягането в бар
+        oilPressure = sensorValue; // Налятането на sensorValue
+        Serial2.print("x7.pco=65535");  // Червен цвят (RGB565 код)
+        Serial2.write(0xff);
+        Serial2.write(0xff);
+        Serial2.write(0xff);
+    }
+    Serial.print("Oil Pressure: ");
+    Serial.print(oilPressure);
+    Serial.println(" bar");
+
+    // Изпращане на стойността на налягането към Nextion дисплея (x7.val)
+    sendOilPressureToNextion(oilPressure);
+}
+
+
+
+
+void updateOilPressureLEDs() {
+    static bool oilPressureLow = false;  // Състояние дали налягането е ниско
+    static int lowPressureCount = 0;    // Брояч за последователни ниски стойности
+    static int maxPressureCount = 0;    // Брояч за последователни максимални стойности
+    static int appliedBrightness = 255; // Последно приложена яркост
+
+    strip26.clear();  // Изчистване на всички светодиоди
+
+    // Проверка на налягането
+    if (oilPressure < x11Value) {
+        lowPressureCount++;            // Увеличаваме брояча при ниско налягане
+        maxPressureCount = 0;          // Нулираме брояча за максимални стойности
+    } else if (oilPressure >= 7.00) {  // Проверка за максимално налягане
+        maxPressureCount++;            // Увеличаваме брояча при максимално налягане
+        lowPressureCount = 0;          // Нулираме брояча за ниски стойности
+    } else {
+        lowPressureCount = 0;          // Нулираме брояча при нормално налягане
+        maxPressureCount = 0;          // Нулираме брояча при нормално налягане
+    }
+
+    // Проверка дали имаме 5 последователни ниски стойности
+    if (lowPressureCount >= 5) {
+        oilPressureLow = true;  // Налягането е ниско след 5 последователни стойности
+    } else {
+        oilPressureLow = false;  // Налягането е нормално или не е достигнало 5 последователни ниски стойности
+    }
+
+    // Отстраняване на грешки в сериен монитор
+    Serial.print("Oil Pressure: ");
+    Serial.println(oilPressure);
+    Serial.print("x11Value: ");
+    Serial.println(x11Value);
+    Serial.print("Low Pressure Count: ");
+    Serial.println(lowPressureCount);
+    Serial.print("Oil Pressure Low: ");
+    Serial.println(oilPressureLow);
+
+    // Управление на светодиодите
+    if (oilPressureLow) {
+        // Ниско налягане: светва само вторият диод в червено
+        Serial.println("Low pressure detected. Activating red LED.");
+        strip26.setPixelColor(1, strip26.Color(255, 0, 0));  // Червен цвят за предупреждение
+         brightness = qrkost;  // Намаляваме яркостта при ниско  
+   
+    } else if (maxPressureCount >= 5) {
+        // Максимално налягане: светва само вторият диод в жълто
+        Serial.println("High pressure detected. Activating yellow LED.");
+        strip26.setPixelColor(1, strip26.Color(255, 100, 0));  // Жълт цвят при максимално налягане
+        brightness = qrkost;  // Намаляваме яркостта при ниско  
+    }
+
+       strip26.setBrightness(qrkost);  // Регулираме яркостта
+    strip26.show();  // Обнови LED светлините
+}
+
+
+
+
+
+
+
+unsigned long previousMillis = 0;  // Променлива за съхранение на времето на последното прочитане
+const unsigned long interval = 100;  // Интервал в милисекунди (например 1000ms = 1 секунда)
+
+
+
+void loop() {
+    unsigned char len = 0;
+    unsigned char buf[8];
+
+    uint16_t batteryVoltageRaw = 0;
+    float batteryVoltage = 0;
+    uint16_t map_gRaw = 0;
+    float map_g = 0;
+    uint16_t mat_gRaw = 0;
+    float mat_g = 0;
+    uint16_t clt_gRaw = 0;
+    float clt_g = 0;
+    float afr_g = 0;
+    float rpm_g = 0;
+    
+    static int16_t previousRpmValue = 0;
+    static float previousbatteryVoltage = 0.0;
+    static float previousafr_g = 0.0;
+
+    static unsigned long lastReadTime = 0;
+
+
+ readSliderFromNextion();
+
+ static unsigned long lastX11ReadTime = 0;
+  static unsigned long lastShiftRpmReadTime = 0;
+ 
+  unsigned long currentMillis = millis();  // Текущото време в милисекунди
+
+    // Обновяване на CAN съобщенията на интервал от 500ms
+    if (millis() - lastCanUpdateTime >= canUpdateInterval) {
+        lastCanUpdateTime = millis(); // Обновяване на времето
+        sendOilPressureToCAN(oilPressure);   // Изпращане на налягането
+        sendOilTempToCAN(smoothedTemperature); // Изпращане на температурата
+    }
+    
+    
+    
+    if (currentMillis - previousMillis >= interval) {
+        previousMillis = currentMillis;  // Актуализираме времето на последното прочитане
+        
+        readThermistorAndSend();  // Изпълняваме функцията за четене и изпращане на температурата
+    }
+ 
+ 
+ 
+ 
+ // Compare oil pressure and x11, and update LEDs on pin 26
+  updateOilPressureLEDs();
+
+    // Add a small delay
+  // Read x11.val every 500ms
+  if (millis() - lastX11ReadTime > 500) {
+    readX11ValueFromNextion();
+    lastX11ReadTime = millis();
+  }
+
+  // Read n0.val every 500ms, but at a different time from x11
+  if (millis() - lastShiftRpmReadTime > 600) {  // Slight delay difference for separation
+    readShiftRpmFromNextion();
+    lastShiftRpmReadTime = millis();
+  }
+    // Прочитане на налягането на масло
+    readOilPressure();
+
+    // Read from CAN bus
+    if (!digitalRead(CAN0_INT)) {
+        CAN0.readMsgBuf(&len, buf);
+        unsigned long canId = CAN0.getCanId();
+
+        switch (canId) {
+            case 1520: {
+                rpm_g = ntohs(*(int16_t *)&buf[6]);
+                rpm_g = (rpm_g + previousRpmValue) / 2;
+                Serial.print("RPM (изгладено): ");
+                Serial.println(rpm_g);
+                sendRPMToNextion(rpm_g);
+                previousRpmValue = rpm_g; // Съхрани стойността
+
+                // Обнови LED лентата
+                updateShiftLight(rpm_g);
+                delay(10);
+            } break;
+
+            case 1523: {
+                batteryVoltageRaw = ntohs(*(int16_t *)&buf[2]);
+                batteryVoltage = batteryVoltageRaw;
+                afr_g = buf[5];
+                afr_g = (afr_g + previousafr_g) / 2;
+                previousafr_g = afr_g;
+                batteryVoltage = (batteryVoltage + previousbatteryVoltage) / 2;
+                previousbatteryVoltage = batteryVoltage;
+                sendBatteryToNextion(batteryVoltage);
+                sendAFRToNextion(afr_g);
+            } break;
+
+            case 1522: {
+                map_gRaw = ntohs(*(int16_t *)&buf[2]);
+                map_g = (map_gRaw / 10);
+                Serial.print("MAP: ");
+                Serial.println(map_g);
+                mat_g = (((int16_t)ntohs(*(int16_t *)&buf[4]) - 320) * 5 / 9);
+                Serial.print("MAT: ");
+                Serial.println(mat_g);
+                clt_g = (((int16_t)ntohs(*(int16_t *)&buf[6]) - 320) * 5 / 9);
+                Serial.print("CLT: ");
+                Serial.println(clt_g);
+                sendMapToNextion(map_g);
+                sendMatToNextion(mat_g);
+                sendCltToNextion(clt_g);
+            } break;
+
+            default:
+                break;
+        }
+    }
+}
